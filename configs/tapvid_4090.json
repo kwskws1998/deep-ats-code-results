@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "raw_root": "data/external/tapvid_4090_s128",
+  "prepared_root": "data/external/tapvid_4090_s128/prepared256_t60",
+  "output_root": "outputs/tapvid_4090_s128_v1",
+  "reference": "references/track_on_r_davis_first.json",
+  "kubric_revision": "a23b6e6e332595c9d92944680a10415e93bfd1e1",
+  "scene_indices": [0, 128],
+  "image_size": 256,
+  "train_length": 60,
+  "validation_fraction": 0.1,
+  "split_seed": 17,
+  "minimum_prepare_free_gib": 100,
+  "seeds": [17],
+  "training": {
+    "steps": 20000,
+    "queries_per_step": 8,
+    "validation_every": 500,
+    "validation_queries": 16,
+    "validation_clips": 8,
+    "feature_dim": 64,
+    "hidden_size": 96,
+    "learning_rate": 0.0003,
+    "learning_rate_schedule": "cosine",
+    "warmup_steps": 1000,
+    "minimum_learning_rate": 0.00003,
+    "validation_observation_fraction": 1.0,
+    "data_cache_clips": 8,
+    "max_gap": 16,
+    "threads": 4,
+    "device": "cuda",
+    "max_hours": 12
+  },
+  "evaluation": {
+    "fractions": [0.25, 0.5, 1.0],
+    "policies": ["uniform", "ats"]
+  }
+}

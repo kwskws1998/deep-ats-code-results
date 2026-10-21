@@ -1,0 +1,50 @@
+[project]
+name = "active-temporal-sampling"
+version = "0.2.0"
+description = "Simulation package for active temporal sampling under volatility and stochasticity."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "matplotlib>=3.7",
+  "gymnasium>=1.0",
+  "pyhgf==0.2.12",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+cognitive = [
+  "scipy>=1.10",
+]
+paper = [
+  "scipy>=1.10",
+  "scikit-learn>=1.2",
+]
+deep = [
+  "torch>=2.0",
+]
+vision = [
+  "torch>=2.0",
+  "Pillow>=10.0",
+  "opencv-python>=4.8",
+]
+rwrl = [
+  "torch>=2.0",
+  "dm-control>=1.0",
+]
+
+[project.scripts]
+ats = "ats.cli:main"
+deep-ats-planner = "deep_ats_planner.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

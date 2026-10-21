@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "model": "Track-On-R",
+  "paper": "Real-World Point Tracking with Verifier-Guided Pseudo-Labeling",
+  "venue": "CVPR 2026",
+  "paper_url": "https://arxiv.org/html/2603.12217v1",
+  "published_pdf_url": "https://openaccess.thecvf.com/content/CVPR2026/papers/Aydemir_Real-World_Point_Tracking_with_Verifier-Guided_Pseudo-Labeling_CVPR_2026_paper.pdf",
+  "project_url": "https://kuis-ai.github.io/track_on_r/",
+  "code_url": "https://github.com/gorkaydemir/track_on",
+  "official_evaluation_code": {
+    "evaluation_url": "https://github.com/gorkaydemir/track_on/blob/main/evaluation/eval.py",
+    "evaluation_git_blob_sha": "44432d542940dc8d751e3539a40f894608c86fcd",
+    "predictor_url": "https://github.com/gorkaydemir/track_on/blob/main/model/trackon_predictor.py",
+    "metric_url": "https://github.com/gorkaydemir/track_on/blob/main/utils/eval_utils.py",
+    "metric_git_blob_sha": "76c713dc2c23e111a59e605b3c4cb5726d1acc3d",
+    "verified_details": "first-query metric, equal-video mean of percentage scores; DAVIS memory size 24 and support_grid_size=20"
+  },
+  "accessed_on": "2026-10-21",
+  "table": "Table 1, Track-On-R (Ours), final three DAVIS columns",
+  "verbatim_metric_excerpt": "68.1 80.3 92.5",
+  "verbatim_protocol_excerpt": "Models are evaluated in the queried-first setting",
+  "dataset": "tapvid_davis",
+  "videos": 30,
+  "queries": 650,
+  "query_count_source": "Counted in the complete official TAP-Vid DAVIS release, not transcribed from Table 1",
+  "query_mode": "first",
+  "input_resolution": 256,
+  "metric_resolution": 256,
+  "observation_fraction": 1.0,
+  "score_scale": "percent",
+  "metrics": {
+    "average_jaccard": 68.1,
+    "average_pts_within_thresh": 80.3,
+    "occlusion_accuracy": 92.5
+  },
+  "evidence_type": "published_table_not_locally_reproduced",
+  "training": "synthetic pretraining plus additional real-world fine-tuning and a pretrained DINOv3 backbone",
+  "selection_scope": "highest verified published single-tracker AJ among searched 256x256 DAVIS first-query results; not a universal all-protocol SOTA claim",
+  "limits": [
+    "Training data, pretrained backbone, model capacity, and selection practices differ from our bounded Kubric-subset experiment.",
+    "Full-observation benchmark scores may be contrasted descriptively; this is not a controlled architecture comparison.",
+    "The official external evaluator uses joint benchmark queries and support_grid_size=20; our tracker processes each query independently, so query context and support-point compute differ.",
+    "No published score is available here for Track-On-R under our sparse acquisition protocol.",
+    "Aggregate table values provide no paired predictions, paired confidence interval, or significance test.",
+    "Published model throughput and GPU memory cannot be compared with our local timing without matched execution."
+  ]
+}
