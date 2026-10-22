@@ -325,7 +325,8 @@ def prepare_tap_data(
             )
         )
 
-    for path in paths:
+    for ordinal, path in enumerate(paths, 1):
+        print(f"[prepare Kubric {ordinal}/{len(paths)}] {path.name}", flush=True)
         clip = read_kubric_archive(path, image_size)
         sources[str(path.resolve())] = sha256(path)
         split = "validation" if path.name in validation_names else "train"
@@ -353,6 +354,7 @@ def prepare_tap_data(
         for index, (name, clip) in enumerate(
             read_davis_archive(davis_path, image_size)
         ):
+            print(f"[prepare DAVIS {index + 1}] {name}", flush=True)
             publish(clip, f"davis_{index:03d}", "test")
     manifest = dict(
         schema_version=1,

@@ -4,6 +4,7 @@ from dataclasses import replace
 import csv
 import json
 from pathlib import Path
+import runpy
 
 import numpy as np
 import pytest
@@ -151,7 +152,16 @@ def test_validation_fraction_is_forwarded_without_using_test_labels(
     def score(*args, **kwargs):
         """Record the fraction passed to the held-out evaluation interface."""
         calls.append(args[4])
-        return dict(average_jaccard=0.5, visible_position_mse=1), None, None
+        return (
+            dict(
+                average_jaccard=0.5,
+                visible_position_mse=1,
+                average_pts_within_thresh=0.6,
+                occlusion_accuracy=0.8,
+            ),
+            None,
+            None,
+        )
 
     data = create_manifest(tmp_path / "data")
     manifest = training.load_tap_manifest(data)
@@ -252,6 +262,85 @@ def test_interrupted_owned_preparation_staging_is_rebuilt(tmp_path, monkeypatch)
     assert final.exists()
     assert not final.parent.with_name("prepared.building").exists()
     assert not final.parent.with_name("prepared.building.json").exists()
+
+
+@pytest.mark.parametrize("free_gib", [86.7, 19.0, 0.0])
+def test_free_space_is_information_and_never_a_fixed_execution_gate(
+    tmp_path, monkeypatch, free_gib
+):
+    import ats_vision.server_experiment as server
+
+    profile = load_profile(PROJECT / "configs/tapvid_4090.json", tmp_path / "suite")
+    profile["raw_root"] = str(tmp_path / "raw")
+    profile["prepared_root"] = str(tmp_path / "prepared")
+    monkeypatch.setattr(
+        server.shutil,
+        "disk_usage",
+        lambda path: type("Disk", (), {"free": int(free_gib * 2**30)})(),
+    )
+    commands = []
+
+    def reached_download(command, **kwargs):
+        """Stop at the download boundary without downloading fixture data."""
+        commands.append(command)
+        raise RuntimeError("download boundary reached")
+
+    monkeypatch.setattr(server.subprocess, "run", reached_download)
+    with pytest.raises(RuntimeError, match="download boundary reached"):
+        server.prepare_server_data(profile)
+    assert commands[0][-128:] == list(map(str, range(128)))
+    assert profile["training"]["steps"] == 20000
+
+
+def test_legacy_minimum_storage_field_is_ignored(tmp_path):
+    original = json.loads((PROJECT / "configs/tapvid_4090.json").read_text())
+    expected = load_profile(PROJECT / "configs/tapvid_4090.json")
+    original["minimum_prepare_free_gib"] = 100
+    path = tmp_path / "old_profile.json"
+    write_json(path, original)
+    assert load_profile(path) == expected
+
+
+def test_server_hotfix_removes_original_guard_and_is_idempotent(tmp_path, monkeypatch):
+    source = """from pathlib import Path
+import shutil
+
+def prepare_server_data(profile):
+    raw = Path(profile["raw_root"])
+    raw.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(raw).free / 2**30
+    present_gib = (
+        sum(path.stat().st_size for path in raw.glob("kubric/*.tar.gz")) / 2**30
+    )
+    required_free = max(20.0, profile["minimum_prepare_free_gib"] - present_gib)
+    if free < required_free:
+        raise RuntimeError("fixed capacity gate")
+    start, stop = profile["scene_indices"]
+    return start, stop
+"""
+    path = tmp_path / "src/ats_vision/server_experiment.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(source)
+    patch = runpy.run_path(str(PROJECT / "scripts/fix_tapvid_storage_gate.py"))[
+        "patch_repo"
+    ]
+    assert patch(tmp_path)
+    assert path.with_suffix(".py.before_storage_fix").read_text() == source
+    assert not patch(tmp_path)
+    namespace = {}
+    exec(compile(path.read_text(), str(path), "exec"), namespace)
+    monkeypatch.setattr(
+        namespace["shutil"],
+        "disk_usage",
+        lambda path: type("Disk", (), {"free": int(86.7 * 2**30)})(),
+    )
+    assert namespace["prepare_server_data"](
+        dict(
+            raw_root=tmp_path / "raw",
+            minimum_prepare_free_gib=100,
+            scene_indices=[0, 128],
+        )
+    ) == (0, 128)
 
 
 def generated_full_evaluation(tmp_path, profile):

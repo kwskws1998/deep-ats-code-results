@@ -127,6 +127,8 @@ class SamplingPolicy:
             return None, {}
         if self.length - time - 1 < remaining:
             raise ValueError("The acquisition budget is infeasible at this clock.")
+        if self.length - time - 1 == remaining:
+            return time + 1, {}
         if self.name in {"uniform", "random"}:
             return int(self._times[used]), {}
         for values, shape in ((covariance, (4, 4)), (q, (2,)), (r, (2,))):

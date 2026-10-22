@@ -8,10 +8,27 @@ import importlib.util
 import json
 import platform
 import sys
+import os
+import tempfile
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+
+
+def atomic_write_json(path: Path, value) -> None:
+    """Publish a complete single-writer JSON record or preserve the previous record."""
+    path = Path(path)
+    encoded = json.dumps(value, indent=2, allow_nan=False) + "\n"
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(encoded)
+        Path(temporary).replace(path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def json_value(value):
@@ -86,7 +103,7 @@ def record_run_failures(function):
                 manifest.update(
                     status="failed", error_type=type(error).__name__, error=str(error)
                 )
-                path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+                atomic_write_json(path, manifest)
             raise
 
     return wrapped
@@ -146,9 +163,7 @@ def prepare_run(output_dir: Path, config, kind: str) -> None:
             )
             if path.is_file()
         }
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, allow_nan=False) + "\n"
-    )
+    atomic_write_json(output_dir / "manifest.json", manifest)
 
 
 def complete_run(output_dir: Path, **metadata) -> None:
@@ -167,7 +182,7 @@ def complete_run(output_dir: Path, **metadata) -> None:
         for item in sorted(Path(output_dir).rglob("*"))
         if item.is_file() and item != path
     }
-    path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+    atomic_write_json(path, manifest)
 
 
 def verify_run(output_dir: Path, check_current_source: bool = False) -> list[str]:
@@ -250,4 +265,4 @@ def register_derived_figures(output_dir: Path) -> None:
         Path(__file__).resolve().parents[2]
     )
     manifest["figures_generated_at_utc"] = datetime.now(timezone.utc).isoformat()
-    manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+    atomic_write_json(manifest_path, manifest)

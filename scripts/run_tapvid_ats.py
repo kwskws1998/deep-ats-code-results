@@ -22,6 +22,10 @@ def main():
         command.add_argument("--threads", type=int, default=2)
         command.add_argument("--seed", type=int, default=17)
     train.add_argument("--resume", action="store_true")
+    train.add_argument("--fork-from", type=Path)
+    train.add_argument(
+        "--execution-backend", choices=("reference", "shared"), default="reference"
+    )
     for name, default in (
         ("steps", 1000),
         ("queries-per-step", 4),
@@ -33,6 +37,9 @@ def main():
         ("max-gap", 16),
         ("warmup-steps", 0),
         ("data-cache-clips", 0),
+        ("query-batch-size", 1),
+        ("encoder-chunk-size", 8),
+        ("validation-query-batch-size", 8),
     ):
         train.add_argument(f"--{name}", type=int, default=default)
     train.add_argument("--learning-rate", type=float, default=0.001)
@@ -65,7 +72,8 @@ def main():
     command = args.pop("command")
     if command == "train":
         resume = args.pop("resume")
-        output = train_tap(TAPTrainConfig(**args), resume)
+        fork_from = args.pop("fork_from")
+        output = train_tap(TAPTrainConfig(**args), resume, fork_from)
     else:
         args["output"] = args.pop("output_root")
         output = evaluate_tap(**args)

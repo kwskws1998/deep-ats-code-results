@@ -19,7 +19,14 @@ from ats_vision.experiment import write_csv, write_json
 from ats_vision.tap_data import load_tap_clip, load_tap_manifest, sha256
 from ats_vision.tap_metrics import tapvid_metrics
 from ats_vision.tap_model import TAPATSModel
+from ats_vision.tap_fast_model import SharedTAPATSModel
+from ats_vision.tap_fast_rollout import shared_point_rollouts
 from ats_vision.tap_rollout import point_rollout, point_training_loss, query_budget
+from ats_vision.tap_batching import (
+    LossAccumulator,
+    point_batch_training_loss,
+    query_microbatches,
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,10 @@ class TAPTrainConfig:
     warmup_steps: int = 0
     minimum_learning_rate: float = 0.0
     data_cache_clips: int = 0
+    query_batch_size: int = 1
+    execution_backend: str = "reference"
+    encoder_chunk_size: int = 8
+    validation_query_batch_size: int = 8
 
 
 def step_learning_rate(config: TAPTrainConfig, step: int) -> float:
@@ -113,22 +124,38 @@ def evaluate_clip(
 ):
     """Evaluate independent query rollouts, then aggregate official counts per video."""
     ids, queries = choose_queries(clip, max_queries, seed, identifier)
-    outputs = []
-    for query_id, query in zip(ids, queries):
-        outputs.append(
-            point_rollout(
-                model,
-                clip.frames,
-                query,
-                fraction,
-                policy,
-                threshold,
-                max_gap,
-                seed + int(query_id),
-                fixed_q,
-                fixed_r,
-            )
+    if getattr(model, "execution_backend", None) == "shared":
+        outputs = shared_point_rollouts(
+            model,
+            clip.frames,
+            queries,
+            fraction,
+            policy,
+            threshold,
+            max_gap,
+            [seed + int(query_id) for query_id in ids],
+            fixed_q,
+            fixed_r,
+            getattr(model, "validation_query_batch_size", 8),
+            getattr(model, "encoder_chunk_size", 8),
         )
+    else:
+        outputs = []
+        for query_id, query in zip(ids, queries):
+            outputs.append(
+                point_rollout(
+                    model,
+                    clip.frames,
+                    query,
+                    fraction,
+                    policy,
+                    threshold,
+                    max_gap,
+                    seed + int(query_id),
+                    fixed_q,
+                    fixed_r,
+                )
+            )
     points = np.stack([item["points"] for item in outputs])
     visibility = np.stack([item["visibility_logits"] for item in outputs])
     predicted_occluded = visibility < math.log(
@@ -194,6 +221,12 @@ def validation_scores(
         visible_position_mse=float(
             np.mean([row["visible_position_mse"] for row in scores])
         ),
+        average_pts_within_thresh=float(
+            np.mean([row["average_pts_within_thresh"] for row in scores])
+        ),
+        occlusion_accuracy=float(
+            np.mean([row["occlusion_accuracy"] for row in scores])
+        ),
     )
 
 
@@ -227,7 +260,8 @@ def load_tap_checkpoint(path: Path, device="cpu", verify_sources=True):
         Path(__file__).resolve().parents[2]
     ):
         raise ValueError("Current sources differ from the fitted checkpoint.")
-    model = TAPATSModel(**saved["model_config"]).to(device)
+    settings = saved["identity"]["config"]
+    model = execution_model(saved["model_config"], settings, device)
     model.load_state_dict(saved["state_dict"], strict=True)
     return model.eval(), saved
 
@@ -246,6 +280,9 @@ def validate_training_config(config: TAPTrainConfig) -> None:
             config.threads,
             config.feature_dim,
             config.hidden_size,
+            config.query_batch_size,
+            config.encoder_chunk_size,
+            config.validation_query_batch_size,
         )
     ):
         raise ValueError("Training and validation budgets must be positive.")
@@ -270,13 +307,27 @@ def validate_training_config(config: TAPTrainConfig) -> None:
         or config.hidden_size < 8
         or config.seed < 0
         or config.device not in {"cpu", "cuda"}
+        or config.execution_backend not in {"reference", "shared"}
     ):
         raise ValueError(
             "Invalid validation fraction, learning-rate schedule, or cache size."
         )
 
 
-def train_tap(config: TAPTrainConfig, resume=False) -> Path:
+def execution_model(model_config, settings, device):
+    """Select a recorded backend without changing parameter names or model capacity."""
+    backend = settings.get("execution_backend", "reference")
+    if backend not in {"reference", "shared"}:
+        raise ValueError("Unknown execution backend.")
+    model = (SharedTAPATSModel if backend == "shared" else TAPATSModel)(
+        **model_config
+    ).to(device)
+    model.encoder_chunk_size = settings.get("encoder_chunk_size", 8)
+    model.validation_query_batch_size = settings.get("validation_query_batch_size", 8)
+    return model
+
+
+def train_tap(config: TAPTrainConfig, resume=False, fork_from=None) -> Path:
     """Fit on Kubric only; save resumable state and a validation-selected model."""
     validate_training_config(config)
     configure_runtime(config.device, config.threads, config.seed)
@@ -292,13 +343,21 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
     identity = checkpoint_identity(config, manifest)
     output = Path(config.output_root)
     model_config = dict(feature_dim=config.feature_dim, hidden_size=config.hidden_size)
-    model = TAPATSModel(**model_config).to(config.device)
+    model = execution_model(model_config, asdict(config), config.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=1e-4
     )
     rng = np.random.default_rng(config.seed)
     first_step, best_key, best_step, logs = 0, (-1.0, -float("inf")), 0, []
-    if resume:
+    best_snapshot = None
+    if resume and fork_from is not None:
+        raise ValueError("Choose exact resume or a separately recorded fork.")
+    fork_payload = None
+    if fork_from is not None:
+        from ats_vision.tap_fork import prepare_training_fork
+
+        fork_payload = prepare_training_fork(config, identity, fork_from)
+    if resume or fork_payload is not None:
         saved = torch.load(
             output / "last.pt", map_location=config.device, weights_only=True
         )
@@ -321,13 +380,25 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
             saved["best_step"],
         )
         logs = saved["logs"]
+        best_snapshot = saved.get("best_snapshot")
+        if best_snapshot is None:
+            best_snapshot = torch.load(
+                output / "model.pt", map_location="cpu", weights_only=True
+            )
+            if best_snapshot["selected_step"] != best_step:
+                raise ValueError(
+                    "Legacy best checkpoint and resumable state disagree; preserve the run for recovery."
+                )
+        atomic_checkpoint(output / "model.pt", best_snapshot)
         recorded["status"] = "running"
         write_json(output / "manifest.json", recorded)
     else:
         prepare_run(output, config, "tapvid_train")
     last_saved = None
     fitting_seconds, validation_seconds, validation_checks = 0.0, 0.0, 0
+    loading_seconds, cache_hits, executed_queries, executed_microbatches = 0.0, 0, 0, 0
     cache = OrderedDict()
+    loss_log = LossAccumulator()
     if config.device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     try:
@@ -337,13 +408,17 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
                 group["lr"] = step_learning_rate(config, step)
             model.train()
             entry = train_entries[int(rng.integers(len(train_entries)))]
+            load_begin = time.perf_counter()
             clip = cache.pop(entry["clip_id"], None)
             if clip is None:
                 clip = load_tap_clip(Path(manifest["root"]) / entry["path"])
+            else:
+                cache_hits += 1
             if config.data_cache_clips:
                 cache[entry["clip_id"]] = clip
                 while len(cache) > config.data_cache_clips:
                     cache.popitem(last=False)
+            loading_seconds += time.perf_counter() - load_begin
             ids, queries = clip.queries()
             eligible = np.flatnonzero((~clip.occluded[ids]).sum(1) > 1)
             if not len(eligible):
@@ -353,7 +428,7 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
             selected = rng.choice(
                 eligible, min(config.queries_per_step, len(eligible)), replace=False
             )
-            losses = []
+            selected_ids, selected_queries, masks = [], [], []
             optimizer.zero_grad(set_to_none=True)
             for choice in selected:
                 index, query = ids[choice], queries[choice]
@@ -370,16 +445,45 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
                             replace=False,
                         )
                     ] = True
-                terms = point_training_loss(
-                    model,
-                    clip.frames,
-                    query,
-                    clip.points[index],
-                    clip.occluded[index],
-                    observed,
-                )
-                (terms["total"] / len(selected)).backward()
-                losses.append(float(terms["total"].detach()))
+                selected_ids.append(index)
+                selected_queries.append(query)
+                masks.append(observed)
+            selected_ids = np.asarray(selected_ids)
+            selected_queries = np.asarray(selected_queries)
+            masks = np.stack(masks)
+            for group in query_microbatches(selected_queries, config.query_batch_size):
+                executed_queries += len(group)
+                executed_microbatches += 1
+                if (
+                    config.query_batch_size == 1
+                    and config.execution_backend == "reference"
+                ):
+                    offset = int(group[0])
+                    terms = point_training_loss(
+                        model,
+                        clip.frames,
+                        selected_queries[offset],
+                        clip.points[selected_ids[offset]],
+                        clip.occluded[selected_ids[offset]],
+                        masks[offset],
+                    )
+                else:
+                    terms = point_batch_training_loss(
+                        model,
+                        clip.frames,
+                        selected_queries[group],
+                        clip.points[selected_ids[group]],
+                        clip.occluded[selected_ids[group]],
+                        masks[group],
+                        shared_features=config.execution_backend == "shared",
+                        encoder_chunk_size=config.encoder_chunk_size,
+                    )
+                if not torch.isfinite(terms["total"]).all():
+                    raise FloatingPointError(
+                        f"Nonfinite training objective at step {step}."
+                    )
+                (terms["total"].sum() / len(selected)).backward()
+                loss_log.add(terms)
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), 5.0, error_if_nonfinite=True
             )
@@ -390,26 +494,40 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
             if step % config.validation_every == 0 or step == 1 or step == config.steps:
                 validation_begin = time.perf_counter()
                 metrics = validation_scores(model, manifest, validation_entries, config)
-                validation_seconds += time.perf_counter() - validation_begin
+                current_validation_seconds = time.perf_counter() - validation_begin
+                validation_seconds += current_validation_seconds
                 validation_checks += 1
                 key = (metrics["average_jaccard"], -metrics["visible_position_mse"])
-                logs.append(dict(step=step, loss=float(np.mean(losses)), **metrics))
+                logs.append(
+                    dict(
+                        step=step,
+                        execution_backend=config.execution_backend,
+                        learning_rate=optimizer.param_groups[0]["lr"],
+                        **loss_log.summary(),
+                        **metrics,
+                    )
+                )
                 if key > best_key:
                     best_key, best_step = key, step
-                    atomic_checkpoint(
-                        output / "model.pt",
-                        dict(
-                            schema_version=1,
-                            kind="tap_ats",
-                            identity=identity,
-                            model_config=model_config,
-                            state_dict=model.state_dict(),
-                            selected_step=step,
-                            validation_metrics=metrics,
-                            selection_complete=False,
-                        ),
+                    best_snapshot = dict(
+                        schema_version=1,
+                        kind="tap_ats",
+                        identity=identity,
+                        model_config=model_config,
+                        state_dict={
+                            name: value.detach().cpu().clone()
+                            for name, value in model.state_dict().items()
+                        },
+                        selected_step=step,
+                        validation_metrics=metrics,
+                        selection_complete=False,
                     )
+                    atomic_checkpoint(output / "model.pt", best_snapshot)
                 last_saved = dict(
+                    schema_version=1,
+                    kind="tap_ats_training_snapshot",
+                    model_config=model_config,
+                    best_snapshot=best_snapshot,
                     identity=identity,
                     state_dict=model.state_dict(),
                     optimizer=optimizer.state_dict(),
@@ -428,7 +546,10 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
                 atomic_checkpoint(output / "last.pt", last_saved)
                 write_csv(output / "training.csv", logs)
                 print(
-                    f"step={step}/{config.steps} validation_AJ={metrics['average_jaccard']:.5f}",
+                    f"step={step}/{config.steps} validation_AJ={metrics['average_jaccard']:.5f} "
+                    f"within={metrics['average_pts_within_thresh']:.5f} OA={metrics['occlusion_accuracy']:.5f} "
+                    f"position_MSE_px2={metrics['visible_position_mse']:.3f} loss={logs[-1]['loss']:.4f} "
+                    f"train_s/update={fitting_seconds / (step - first_step):.3f} validation_s={current_validation_seconds:.2f}",
                     flush=True,
                 )
                 remaining_checks = sum(
@@ -445,6 +566,17 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
                         completed_updates_this_session=step - first_step,
                         mean_fitting_step_seconds=fitting_seconds / (step - first_step),
                         mean_validation_seconds=validation_seconds / validation_checks,
+                        mean_loading_step_seconds=loading_seconds / (step - first_step),
+                        mean_nonloading_step_seconds=(fitting_seconds - loading_seconds)
+                        / (step - first_step),
+                        cache_hit_fraction=cache_hits / (step - first_step),
+                        configured_query_batch_size=config.query_batch_size,
+                        execution_backend=config.execution_backend,
+                        encoder_chunk_size=config.encoder_chunk_size,
+                        validation_query_batch_size=config.validation_query_batch_size,
+                        mean_executed_query_batch_size=executed_queries
+                        / executed_microbatches,
+                        timing_estimate_provisional=(step - first_step) < 20,
                         estimated_remaining_fitting_and_validation_hours=projected
                         / 3600,
                         excludes="final calibration and final test evaluation",
@@ -461,7 +593,9 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
                         ),
                     ),
                 )
-                if projected > config.max_hours * 3600:
+                if projected > config.max_hours * 3600 and step - first_step >= min(
+                    20, config.steps - first_step
+                ):
                     write_json(
                         output / "compute_gate.json",
                         dict(
@@ -479,8 +613,22 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
         for entry in train_entries[: min(8, len(train_entries))]:
             clip = load_tap_clip(Path(manifest["root"]) / entry["path"])
             ids, queries = choose_queries(clip, 2, config.seed + 2000, entry["clip_id"])
-            for query in queries:
-                result = point_rollout(model, clip.frames, query, 1.0, "uniform")
+            if config.execution_backend == "shared":
+                results = shared_point_rollouts(
+                    model,
+                    clip.frames,
+                    queries,
+                    1.0,
+                    "uniform",
+                    query_batch_size=config.validation_query_batch_size,
+                    encoder_chunk_size=config.encoder_chunk_size,
+                )
+            else:
+                results = [
+                    point_rollout(model, clip.frames, query, 1.0, "uniform")
+                    for query in queries
+                ]
+            for result in results:
                 q_values.extend(result["q_reads"])
                 r_values.extend(result["r_reads"][1:])
         if not r_values:
@@ -544,7 +692,8 @@ def train_tap(config: TAPTrainConfig, resume=False) -> Path:
                 supervision="visible xy and occlusion only; no velocities, clean images, or true Q/R",
                 uncertainty="effective coordinate measurement/dynamics error; physical Q/R separation is not established",
                 evaluation="first-visible public query; query and all earlier frames excluded from metrics",
-                accounting="each query is independent; every acquired image-query pair is charged; no cross-query feature cache",
+                accounting="independent query states; every acquired image-query pair is charged; shared backend reuses query-independent encoder features only",
+                execution_backend=config.execution_backend,
                 limits="small CNN and approximate Gaussian planner; no SOTA/novelty claim",
             ),
         )
@@ -775,7 +924,10 @@ def evaluate_tap(
                     and all(entry["dataset"] == "tapvid_davis" for entry in entries)
                 ),
                 modified_protocol="per-query observation budget; not directly comparable to full-observation published rankings",
-                accounting="independent image-query acquisitions, including query; no cross-query cache or free preview",
+                accounting="independent image-query acquisitions, including query; shared backend reuses only query-independent features from the acquisition union; no free observations",
+                execution_backend=saved["identity"]["config"].get(
+                    "execution_backend", "reference"
+                ),
                 selection=selection,
                 bootstrap="whole-video exploratory paired intervals; no multiplicity correction",
                 runtime="encoder and planner wall time after stored-frame decoding; not equal total compute",

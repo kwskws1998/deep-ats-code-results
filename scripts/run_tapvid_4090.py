@@ -41,8 +41,24 @@ def main() -> None:
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--max-hours", type=float)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fork-from", type=Path)
+    parser.add_argument("--raw-root", type=Path)
+    parser.add_argument("--prepared-root", type=Path)
     args = parser.parse_args()
-    profile = load_profile(args.config, args.output_root, args.seeds, args.max_hours)
+    profile = load_profile(
+        args.config,
+        args.output_root,
+        args.seeds,
+        args.max_hours,
+        args.raw_root,
+        args.prepared_root,
+    )
+    if args.fork_from is not None and (
+        args.resume or args.stage not in {"train", "all"} or len(profile["seeds"]) != 1
+    ):
+        parser.error(
+            "--fork-from requires train/all, exactly one seed, and no --resume."
+        )
     if args.stage == "plan":
         print(json.dumps(profile, indent=2))
         print(
@@ -54,7 +70,7 @@ def main() -> None:
     if args.stage == "preflight":
         print(gpu_preflight(profile), flush=True)
     if args.stage in {"train", "all"}:
-        if not run_training(profile, args.resume):
+        if not run_training(profile, args.resume, args.fork_from):
             sys.exit(2)
     if args.stage in {"validate", "all"}:
         run_evaluation(profile, "validation", args.resume)

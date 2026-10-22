@@ -25,6 +25,7 @@ from ats_vision.experiment import write_csv, write_json
 from ats_vision.tap_data import load_tap_clip, load_tap_manifest, sha256
 from ats_vision.tap_model import TAPATSModel
 from ats_vision.tap_rollout import point_training_loss, query_budget
+from ats_vision.tap_batching import point_batch_training_loss
 from ats_vision.tap_training import (
     TAPTrainConfig,
     configure_runtime,
@@ -38,9 +39,17 @@ EVALUATOR_SHA256 = "90cd01e53e23f6d489d3a6cd840cfd93fed4c1a6f4a0dfd373933cc164f0
 METRICS = ("average_jaccard", "average_pts_within_thresh", "occlusion_accuracy")
 
 
-def load_profile(path: Path, output_root=None, seeds=None, max_hours=None) -> dict:
+def load_profile(
+    path: Path,
+    output_root=None,
+    seeds=None,
+    max_hours=None,
+    raw_root=None,
+    prepared_root=None,
+) -> dict:
     """Validate a declared server plan without downloading data or allocating a GPU."""
     profile = json.loads(Path(path).read_text())
+    profile.pop("minimum_prepare_free_gib", None)
     required = {
         "schema_version",
         "raw_root",
@@ -53,7 +62,6 @@ def load_profile(path: Path, output_root=None, seeds=None, max_hours=None) -> di
         "train_length",
         "validation_fraction",
         "split_seed",
-        "minimum_prepare_free_gib",
         "seeds",
         "training",
         "evaluation",
@@ -66,6 +74,9 @@ def load_profile(path: Path, output_root=None, seeds=None, max_hours=None) -> di
         profile["seeds"] = list(seeds)
     if max_hours is not None:
         profile["training"]["max_hours"] = max_hours
+    for key, override in (("raw_root", raw_root), ("prepared_root", prepared_root)):
+        if override is not None:
+            profile[key] = str(override)
     for key in ("raw_root", "prepared_root", "output_root", "reference"):
         profile[key] = str((PROJECT / profile[key]).resolve())
     start, stop = profile["scene_indices"]
@@ -83,12 +94,11 @@ def load_profile(path: Path, output_root=None, seeds=None, max_hours=None) -> di
         or not 2 <= profile["train_length"] <= 120
         or 120 % profile["train_length"]
         or not 0 < profile["validation_fraction"] < 1
-        or profile["minimum_prepare_free_gib"] <= 0
         or not profile["seeds"]
         or any(not isinstance(seed, int) or seed < 0 for seed in profile["seeds"])
         or len(set(profile["seeds"])) != len(profile["seeds"])
     ):
-        raise ValueError("Invalid resolution, windows, split, disk budget, or seeds.")
+        raise ValueError("Invalid resolution, windows, split, or seeds.")
     allowed = {field.name for field in fields(TAPTrainConfig)} - {
         "data_manifest",
         "output_root",
@@ -179,14 +189,7 @@ def prepare_server_data(profile: dict) -> Path:
     raw = Path(profile["raw_root"])
     raw.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(raw).free / 2**30
-    present_gib = (
-        sum(path.stat().st_size for path in raw.glob("kubric/*.tar.gz")) / 2**30
-    )
-    required_free = max(20.0, profile["minimum_prepare_free_gib"] - present_gib)
-    if free < required_free:
-        raise RuntimeError(
-            f"Only {free:.1f} GiB free; this preparation stage requires {required_free:.1f} GiB of remaining free-space allowance."
-        )
+    print(f"Available storage at {raw}: {free:.1f} GiB (informational).", flush=True)
     start, stop = profile["scene_indices"]
     present = {path.name for path in (raw / "kubric").glob("*.tar.gz")}
     expected = {f"{index:04d}.tar.gz" for index in range(start, stop)}
@@ -303,10 +306,6 @@ def gpu_preflight(profile: dict) -> Path:
     config = profile["training"]
     configure_runtime("cuda", config["threads"], profile["seeds"][0])
     properties = torch.cuda.get_device_properties(0)
-    if "4090" not in properties.name or properties.total_memory < 20 * 2**30:
-        raise RuntimeError(
-            f"Expected an RTX 4090 with >=20 GiB VRAM; got {properties.name}."
-        )
     manifest = load_tap_manifest(dataset_manifest(profile), verify=False)
     entry = next(row for row in manifest["clips"] if row["split"] == "train")
     clip = load_tap_clip(Path(manifest["root"]) / entry["path"])
@@ -318,30 +317,63 @@ def gpu_preflight(profile: dict) -> Path:
         raise ValueError(
             "Training preflight clip has no supervised future-visible query."
         )
-    choice = min(eligible, key=lambda index: queries[index, 0])
-    model = TAPATSModel(config["feature_dim"], config["hidden_size"]).cuda()
+    batch_size = min(config.get("query_batch_size", 1), config["queries_per_step"])
+    groups = [
+        np.asarray([index for index in eligible if queries[index, 0] == clock])
+        for clock in sorted(set(queries[eligible, 0]))
+    ]
+    choices = next(
+        (group[:batch_size] for group in groups if len(group) >= batch_size), None
+    )
+    if choices is None:
+        raise ValueError(
+            "Preflight requires enough same-clock queries for the configured microbatch."
+        )
+    from ats_vision.tap_training import execution_model
+
+    model = execution_model(
+        dict(feature_dim=config["feature_dim"], hidden_size=config["hidden_size"]),
+        config,
+        "cuda",
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config["learning_rate"], weight_decay=1e-4
     )
-    observed = np.ones(len(clip.frames), bool)
-    observed[: int(queries[choice, 0])] = False
+    observed = np.ones((batch_size, len(clip.frames)), bool)
+    observed[:, : int(queries[choices[0], 0])] = False
     timings = []
     torch.cuda.reset_peak_memory_stats()
     for index in range(4):
         torch.cuda.synchronize()
         begin = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        terms = point_training_loss(
-            model,
-            clip.frames,
-            queries[choice],
-            clip.points[ids[choice]],
-            clip.occluded[ids[choice]],
-            observed,
-        )
-        if not torch.isfinite(terms["total"]):
+        if (
+            batch_size == 1
+            and config.get("execution_backend", "reference") == "reference"
+        ):
+            choice = int(choices[0])
+            terms = point_training_loss(
+                model,
+                clip.frames,
+                queries[choice],
+                clip.points[ids[choice]],
+                clip.occluded[ids[choice]],
+                observed[0],
+            )
+        else:
+            terms = point_batch_training_loss(
+                model,
+                clip.frames,
+                queries[choices],
+                clip.points[ids[choices]],
+                clip.occluded[ids[choices]],
+                observed,
+                shared_features=config.get("execution_backend") == "shared",
+                encoder_chunk_size=config.get("encoder_chunk_size", 8),
+            )
+        if not torch.isfinite(terms["total"]).all():
             raise RuntimeError("Nonfinite loss in the CUDA preflight.")
-        terms["total"].backward()
+        terms["total"].mean().backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
         optimizer.step()
         torch.cuda.synchronize()
@@ -356,14 +388,17 @@ def gpu_preflight(profile: dict) -> Path:
         parameters=sum(p.numel() for p in model.parameters()),
         precision="float32; no autocast",
         image_size=256,
-        frames=len(clip.frames) - int(queries[choice, 0]),
-        simultaneous_queries=1,
+        frames=len(clip.frames) - int(queries[choices[0], 0]),
+        simultaneous_queries=batch_size,
+        execution_backend=config.get("execution_backend", "reference"),
+        encoder_chunk_size=config.get("encoder_chunk_size", 8),
         matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
         cudnn_allow_tf32=torch.backends.cudnn.allow_tf32,
         queries_per_optimizer_update=config["queries_per_step"],
-        timed_query_seconds=timings,
-        mean_query_seconds=float(np.mean(timings)),
+        timed_microbatch_seconds=timings,
+        mean_query_seconds=float(np.mean(timings)) / batch_size,
         rough_fitting_hours_full_read=float(np.mean(timings))
+        / batch_size
         * config["queries_per_step"]
         * config["steps"]
         / 3600,
@@ -376,16 +411,29 @@ def gpu_preflight(profile: dict) -> Path:
     destination = output / "preflight" / f"cuda_{name}.json"
     destination.parent.mkdir(exist_ok=True)
     write_json(destination, report)
-    print(json.dumps(report, indent=2), flush=True)
+    print(
+        json.dumps(
+            {key: value for key, value in report.items() if key != "sources"}, indent=2
+        ),
+        flush=True,
+    )
     del terms, optimizer, model
     torch.cuda.empty_cache()
     return destination
 
 
-def run_training(profile: dict, resume=False) -> bool:
+def run_training(profile: dict, resume=False, fork_from=None) -> bool:
     """Fit only our model; stop the suite if any seed is unfinished or deferred."""
     validate_prepared_profile(profile)
     output = freeze_suite(profile)
+    if fork_from is not None and (
+        resume
+        or len(profile["seeds"]) != 1
+        or (output / f"seed{profile['seeds'][0]}" / "train").exists()
+    ):
+        raise ValueError(
+            "Fork requires a fresh single-seed training directory and no --resume."
+        )
     gpu_preflight(profile)
     for seed in profile["seeds"]:
         directory = output / f"seed{seed}" / "train"
@@ -405,7 +453,7 @@ def run_training(profile: dict, resume=False) -> bool:
         config = TAPTrainConfig(
             dataset_manifest(profile), directory, seed=seed, **profile["training"]
         )
-        train_tap(config, resume=state is not None)
+        train_tap(config, resume=state is not None, fork_from=fork_from)
         if (
             json.loads((directory / "manifest.json").read_text())["status"]
             != "completed"

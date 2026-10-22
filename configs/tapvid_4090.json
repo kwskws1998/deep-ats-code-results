@@ -10,7 +10,6 @@
   "train_length": 60,
   "validation_fraction": 0.1,
   "split_seed": 17,
-  "minimum_prepare_free_gib": 100,
   "seeds": [17],
   "training": {
     "steps": 20000,

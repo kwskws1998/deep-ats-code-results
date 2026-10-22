@@ -20,7 +20,12 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from ats.artifacts import complete_run, prepare_run, record_run_failures
+from ats.artifacts import (
+    atomic_write_json,
+    complete_run,
+    prepare_run,
+    record_run_failures,
+)
 from ats_vision.data import VideoData, load_data, moving_blobs, validate_splits
 from ats_vision.figures import plot_results
 from ats_vision.model import Belief, VideoATSModel, gaussian_nll
@@ -96,17 +101,23 @@ class VisionConfig:
 
 def write_json(path: Path, value) -> None:
     """Write strict JSON so nonfinite results cannot silently enter a report."""
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    atomic_write_json(path, value)
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
     """Write a nonempty table with a fixed field order."""
     if not rows:
         raise ValueError("Refuse an empty results table.")
-    with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", newline="") as stream:
+            fields = list(dict.fromkeys(key for row in rows for key in row))
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def training_mask(

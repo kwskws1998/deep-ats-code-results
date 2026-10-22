@@ -11,6 +11,7 @@ def tapvid_metrics(
     target_occluded: np.ndarray,
     predicted_points: np.ndarray,
     predicted_occluded: np.ndarray,
+    evaluation_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Aggregate counts over queries/time within one video, excluding query/past frames.
 
@@ -38,6 +39,10 @@ def tapvid_metrics(
     ):
         raise ValueError("Invalid query clock.")
     evaluated = np.arange(length)[None, :] > clock[:, None]
+    if evaluation_mask is not None:
+        if evaluation_mask.shape != evaluated.shape or evaluation_mask.dtype != bool:
+            raise ValueError("Evaluation mask must be boolean [N,T].")
+        evaluated &= evaluation_mask
     visible = ~target_occluded
     predicted_visible = ~predicted_occluded
     count = int(evaluated.sum())

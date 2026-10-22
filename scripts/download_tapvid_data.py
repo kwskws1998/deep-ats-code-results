@@ -46,12 +46,31 @@ def repository_entries(revision: str) -> dict:
 def download(url: str, destination: Path, expected: str, algorithm: str) -> dict:
     """Resume a verified byte range and atomically publish only a matching file."""
     destination.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[download] {destination.name}: checking existing bytes", flush=True)
     if destination.exists():
         if digest_file(destination, algorithm) != expected:
             raise ValueError(f"Existing file checksum mismatch: {destination}")
     else:
         partial = destination.with_suffix(destination.suffix + ".part")
         offset = partial.stat().st_size if partial.exists() else 0
+        if offset and digest_file(partial, algorithm) == expected:
+            partial.replace(destination)
+            print(
+                f"[download] {destination.name}: recovered complete verified partial",
+                flush=True,
+            )
+            return dict(
+                url=url,
+                path=str(destination.resolve()),
+                bytes=destination.stat().st_size,
+                sha256=digest_file(destination),
+                published_checksum=expected,
+                checksum_algorithm=algorithm,
+            )
+        print(
+            f"[download] {destination.name}: starting at {offset / 1e6:.1f} MB",
+            flush=True,
+        )
         request = urllib.request.Request(
             url, headers={"Range": f"bytes={offset}-"} if offset else {}
         )
@@ -66,16 +85,28 @@ def download(url: str, destination: Path, expected: str, algorithm: str) -> dict
                     "Server did not honor resume range; remove only the .part file to restart."
                 )
             last = time.monotonic()
+            content_length = response.headers.get("Content-Length")
+            total = offset + int(content_length) if content_length is not None else None
             with partial.open("ab" if offset else "wb") as stream:
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
                     stream.write(chunk)
                     offset += len(chunk)
-                    if time.monotonic() - last > 10:
-                        print(f"{destination.name}: {offset / 1e6:.1f} MB", flush=True)
+                    if time.monotonic() - last > 5:
+                        progress = (
+                            f"{offset / 1e6:.1f}/{total / 1e6:.1f} MB ({100 * offset / total:.1f}%)"
+                            if total
+                            else f"{offset / 1e6:.1f} MB"
+                        )
+                        print(f"[download] {destination.name}: {progress}", flush=True)
                         last = time.monotonic()
+        print(f"[download] {destination.name}: verifying checksum", flush=True)
         if digest_file(partial, algorithm) != expected:
             raise ValueError(f"Downloaded checksum mismatch: {partial}")
         partial.replace(destination)
+    print(
+        f"[download] {destination.name}: verified complete ({destination.stat().st_size / 1e6:.1f} MB)",
+        flush=True,
+    )
     return dict(
         url=url,
         path=str(destination.resolve()),
@@ -121,8 +152,10 @@ def main() -> None:
             )
         entries = repository_entries(revision)
         manifest["kubric_revision"] = revision
-        for index in sorted(set(args.kubric_scenes)):
+        indices = sorted(set(args.kubric_scenes))
+        for ordinal, index in enumerate(indices, 1):
             name = f"{index:04d}.tar.gz"
+            print(f"[Kubric {ordinal}/{len(indices)}] {name}", flush=True)
             if name not in entries:
                 raise ValueError(
                     f"Scene {name} is absent from the pinned repository revision."

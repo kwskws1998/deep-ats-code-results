@@ -209,3 +209,9 @@ Manifests distinguish completed and failed runs and include implementation, entr
 
 For the real-video ATS-CNN experiment and one published Track-On-R reference, use [the 4090 setup/run guide](docs/tapvid_4090.md). The entrypoints are `scripts/setup_tapvid_4090.py` and `scripts/run_tapvid_4090.py`; `configs/tapvid_4090.json` freezes the training and evaluation plan. External competitor training is not required.
 
+The [2026-10-22 review and diagnostic guide](docs/tapvid_review_20261022.md) adds checkpoint diagnosis, train-only overfit/throughput probes, component/calibration reports, and opt-in true query microbatches. Use a separate checkout alongside an active experiment so its source fingerprints remain valid.
+
+The [4090 execution-speed guide](docs/tapvid_speed_20261022.md) adds shared encoder work, batched causal validation, synchronization-free 2D algebra, and explicit checkpoint continuation into a separate run. Use `configs/tapvid_4090_fast.json`; the original profiles remain available.
+
+The [AJ failure diagnosis](docs/tapvid_failure_diagnosis_20261022.md) separates checked implementation contracts, structural tracking weaknesses, and unavailable evidence from the deleted server run. `scripts/diagnose_tapvid.py failure-audit` adds frozen train/validation component, self-match, filter, calibration, gradient and diagnostic-control reports.
+
